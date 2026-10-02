@@ -4,7 +4,7 @@ import { getMySQLDatabase } from "@/lib/db";
 import { getRedisClient } from "@/lib/redis";
 import { currentSessionUser } from "@/lib/auth";
 import { canModifyMapStatus } from "@/lib/privs";
-import { RankedStatus, statusStringToId } from "@/lib/beatmap-status";
+import { RankedStatus, statusStringToId, withStatus } from "@/lib/beatmap-status";
 import { fetchBeatmap } from "@/lib/mist";
 
 const REFX_REFRESH_CHANNEL = "refx:refresh_bmap_cache";
@@ -21,25 +21,37 @@ async function rankAction(formData: FormData) {
   const status = String(formData.get("status") ?? "");
   const scope = String(formData.get("scope") ?? "map");
   const beatmapId = Number(formData.get("beatmapId"));
-  if (!status || (scope !== "map" && scope !== "set") || !beatmapId) {
+  // optional per-mode rank: comma-separated mode ids (0-15), default all.
+  const modesRaw = String(formData.get("modes") ?? "").trim();
+  const modes = modesRaw
+    ? modesRaw.split(",").map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n <= 15)
+    : Array.from({ length: 16 }, (_, i) => i);
+  if (!status || (scope !== "map" && scope !== "set") || !beatmapId || !modes.length) {
     throw new Error("Invalid rank request");
   }
   const newStatus = statusStringToId(status);
+  const allModes = modes.length === 16;
 
   const beatmap = await db("maps").where("id", beatmapId).first();
   if (!beatmap) throw new Error("Beatmap not found");
 
+  const applyMask = (current: number | bigint) =>
+    modes.reduce((mask, m) => withStatus(mask, m, newStatus), Number(current ?? 80421421917330));
+
   await db.transaction(async (trx) => {
-    if (scope === "set") {
-      await trx("maps").where("set_id", beatmap.set_id).update({ status: newStatus, frozen: 1 });
-    } else {
-      await trx("maps").where("id", beatmap.id).update({ status: newStatus, frozen: 1 });
-    }
-    const ids = await trx("maps")
+    const targets = await trx("maps")
       .where(scope === "set" ? "set_id" : "id", scope === "set" ? beatmap.set_id : beatmap.id)
-      .select("id");
+      .select("id", "status_mask");
+    for (const t of targets) {
+      // global status only follows a full 16-mode rank; partial ranks
+      // touch the mask so old readers don't lie.
+      const patch: Record<string, unknown> = { status_mask: applyMask(t.status_mask), frozen: 1 };
+      if (allModes) patch.status = newStatus;
+      await trx("maps").where("id", t.id).update(patch);
+    }
+    const ids = targets.map((t: any) => t.id);
     if (ids.length) {
-      await trx("map_requests").whereIn("map_id", ids.map((m: any) => m.id)).update({ active: 0 });
+      await trx("map_requests").whereIn("map_id", ids).update({ active: 0 });
     }
   });
 
@@ -145,6 +157,7 @@ export default async function BeatmapsPage({
                 <option value="map">Map</option>
                 <option value="set">Set</option>
               </select>
+              <InputField label="Modes (blank = all)" name="modes" placeholder="0,1,2,3" />
               <Button type="submit">Apply</Button>
             </form>
           </div>
